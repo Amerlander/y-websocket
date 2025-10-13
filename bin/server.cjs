@@ -5,6 +5,9 @@ const http = require('http')
 const number = require('lib0/number')
 const wss = new WebSocket.Server({ noServer: true })
 const setupWSConnection = require('./utils.cjs').setupWSConnection
+const docs = require('./utils.cjs').docs
+const getPersistence = require('./utils.cjs').getPersistence
+const { initCleanupScheduler } = require('./cleanup-scheduler.cjs')
 
 const host = process.env.HOST || 'localhost'
 const port = number.parseInt(process.env.PORT || '1234')
@@ -28,4 +31,10 @@ server.on('upgrade', (request, socket, head) => {
 
 server.listen(port, host, () => {
   console.log(`running at '${host}' on port ${port}`)
+  
+  // Initialize the cleanup scheduler for persistent rooms
+  const persistence = getPersistence()
+  const cleanupScheduler = initCleanupScheduler(docs, persistence)
+  
+  console.log('Persistent room cleanup scheduler started')
 })
