@@ -13,15 +13,15 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "start": "node ./bin/server.cjs",
+    "start": "node ./bin/server.js",
     "dist": "npm run clean && rollup -c && tsc --skipLibCheck",
     "lint": "standard && tsc --skipLibCheck",
     "test": "npm run lint",
     "preversion": "npm run dist && test -e dist/y-websocket.d.ts && test -e dist/y-websocket.cjs"
   },
   "bin": {
-    "y-websocket-server": "./bin/server.cjs",
-    "y-websocket": "./bin/server.cjs"
+    "y-websocket-server": "./bin/server.js",
+    "y-websocket": "./bin/server.js"
   },
   "files": [
     "dist/*",
@@ -30,8 +30,8 @@
   ],
   "exports": {
     "./package.json": "./package.json",
-    "./bin/utils": "./bin/utils.cjs",
-    "./bin/callback": "./bin/callback.cjs",
+    "./bin/utils": "./bin/utils.js",
+    "./bin/callback": "./bin/callback.js",
     ".": {
       "module": "./src/y-websocket.js",
       "import": "./src/y-websocket.js",
