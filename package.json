@@ -60,8 +60,8 @@
     ]
   },
   "dependencies": {
-    "@y/protocols": "^1.0.6-3",
-    "lib0": "^0.2.115-6",
+    "y-protocols": "^1.0.6",
+    "lib0": "^0.2.99",
     "lodash.debounce": "^4.0.8"
   },
   "devDependencies": {
@@ -71,10 +71,10 @@
     "rollup": "^4.43.0",
     "standard": "^17.1.2",
     "typescript": "^5.8.3",
-    "@y/y": "^14.0.0-16"
+    "yjs": "^13.6.27"
   },
   "peerDependencies": {
-    "@y/y": "^14.0.0-16"
+    "yjs": "^13.6.27"
   },
   "optionalDependencies": {
     "ws": "^8.18.0",

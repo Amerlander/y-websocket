@@ -1,6 +1,6 @@
-const Y = require('@y/y')
-const syncProtocol = require('@y/protocols/sync')
-const awarenessProtocol = require('@y/protocols/awareness')
+const Y = require('yjs')
+const syncProtocol = require('y-protocols/sync')
+const awarenessProtocol = require('y-protocols/awareness')
 
 const encoding = require('lib0/encoding')
 const decoding = require('lib0/decoding')
