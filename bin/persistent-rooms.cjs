@@ -1,11 +1,12 @@
 /**
  * Persistent room utilities
- * These rooms should not be deleted when all users disconnect
+ * All rooms are now persistent (stored on server).
+ * Password-protected rooms have their first word from this special list.
  */
 
-// List of words that identify persistent rooms
+// List of words that identify password-protected rooms
 // This should match the frontend's persistent_room_words list
-const persistentRoomWords = [
+const passwordProtectedRoomWords = [
   "zimmerpflanze",
   "sonnenaufgang",
   "kinderwagen",
@@ -56,12 +57,16 @@ const persistentRoomWords = [
   "eichenhain"
 ]
 
+// Keep backward compatibility alias
+const persistentRoomWords = passwordProtectedRoomWords
+
 /**
- * Check if a room name indicates it should be persistent
+ * Check if a room name indicates it requires a password.
+ * Password-protected rooms have the first word from passwordProtectedRoomWords.
  * @param {string} roomName - The name of the room
- * @returns {boolean} True if the room should be persistent
+ * @returns {boolean} True if the room requires a password
  */
-const isPersistentRoom = (roomName) => {
+const isPasswordProtectedRoom = (roomName) => {
   if (!roomName || typeof roomName !== 'string') {
     return false
   }
@@ -69,12 +74,22 @@ const isPersistentRoom = (roomName) => {
   // Split the room name by dashes or spaces to get individual words
   const words = roomName.toLowerCase().split(/[-\s]+/)
   
-  // Check if the first word is in the persistent room words list
+  // Check if the first word is in the password-protected room words list
   if (words.length > 0) {
-    return persistentRoomWords.includes(words[0])
+    return passwordProtectedRoomWords.includes(words[0])
   }
   
   return false
+}
+
+/**
+ * All rooms are now persistent.
+ * @param {string} roomName - The name of the room
+ * @returns {boolean} Always returns true - all rooms are persistent
+ */
+const isPersistentRoom = (roomName) => {
+  // All rooms are now persistent
+  return true
 }
 
 /**
@@ -109,8 +124,10 @@ const getMaxInactiveAge = () => {
 
 module.exports = {
   isPersistentRoom,
+  isPasswordProtectedRoom,
   getCleanupInterval,
   getMemoryUnloadAge,
   getMaxInactiveAge,
-  persistentRoomWords
+  persistentRoomWords,
+  passwordProtectedRoomWords
 }

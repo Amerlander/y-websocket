@@ -27,19 +27,25 @@ const persistenceDir = process.env.YPERSISTENCE
  */
 let persistence = null
 if (typeof persistenceDir === 'string') {
-  console.info('Persisting documents to "' + persistenceDir + '"')
+  console.info('📦 Persisting documents to "' + persistenceDir + '"')
   // @ts-ignore
   const LeveldbPersistence = require('y-leveldb').LeveldbPersistence
   const ldb = new LeveldbPersistence(persistenceDir)
   persistence = {
     provider: ldb,
     bindState: async (docName, ydoc) => {
+      console.log(`🔗 [${docName}] Binding persistence...`)
       const persistedYdoc = await ldb.getYDoc(docName)
       const newUpdates = Y.encodeStateAsUpdate(ydoc)
       ldb.storeUpdate(docName, newUpdates)
       Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc))
+      console.log(`✅ [${docName}] Loaded persisted state`)
+      
+      let updateCount = 0
       ydoc.on('update', update => {
+        updateCount++
         ldb.storeUpdate(docName, update)
+        console.log(`💾 [${docName}] Update #${updateCount} persisted (${update.length} bytes)`)
       })
     },
     writeState: async (_docName, _ydoc) => {}
@@ -178,9 +184,16 @@ exports.WSSharedDoc = WSSharedDoc
 const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
+  
+  const persistentIcon = doc.isPersistent ? '🔒' : '🔓'
+  console.log(`${persistentIcon} [${docname}] Creating document (persistent: ${doc.isPersistent})`)
+  
   if (persistence !== null) {
     persistence.bindState(docname, doc)
+  } else {
+    console.log(`⚠️  [${docname}] No persistence configured - data will be lost on restart!`)
   }
+  
   docs.set(docname, doc)
   return doc
 })
