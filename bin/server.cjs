@@ -187,7 +187,7 @@ if (ENABLE_CLUSTER && cluster.isMaster) {
       return
     }
     
-    // GET /room/:roomName/info - Get room metadata (for password-protected room verification)
+    // GET /room/:roomName/info - Get room metadata (for password-protected room verification and key verification)
     if (request.method === 'GET' && url.pathname.startsWith('/room/') && url.pathname.endsWith('/info')) {
       const roomName = decodeURIComponent(url.pathname.slice(6, -5)) // Remove '/room/' and '/info'
       
@@ -202,13 +202,25 @@ if (ENABLE_CLUSTER && cluster.isMaster) {
         return
       }
       
+      // Try to get the admin's public key from the roomClaim in the Y.Doc
+      let adminPublicKey = null
+      try {
+        const roomClaimMap = doc.getMap('roomClaim')
+        if (roomClaimMap) {
+          adminPublicKey = roomClaimMap.get('publicKey') || null
+        }
+      } catch (e) {
+        console.error('Error reading roomClaim:', e)
+      }
+      
       response.writeHead(200, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({
         exists: true,
         isPersistent: doc.isPersistent,
         hasPassword: !!doc.passwordHash,
         connectionCount: doc.conns.size,
-        lastAccessed: doc.lastAccessed
+        lastAccessed: doc.lastAccessed,
+        adminPublicKey: adminPublicKey
       }))
       return
     }
