@@ -6,7 +6,7 @@
  * 3. Delete from disk after MAX_INACTIVE_DAYS (default: 30 days)
  */
 
-const Y = require('@y/y')
+const Y = require('yjs')
 const { getCleanupInterval, getMemoryUnloadAge, getMaxInactiveAge } = require('./persistent-rooms.cjs')
 
 /**

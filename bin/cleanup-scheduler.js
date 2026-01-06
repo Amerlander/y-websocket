@@ -6,7 +6,7 @@
  * 3. Delete from disk after MAX_INACTIVE_DAYS (default: 30 days)
  */
 
-import * as Y from '@y/y'
+import * as Y from 'yjs'
 import { getCleanupInterval, getMemoryUnloadAge, getMaxInactiveAge } from './persistent-rooms.js'
 
 /**

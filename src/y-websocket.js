@@ -4,14 +4,14 @@
 
 /* eslint-env browser */
 
-import * as Y from '@y/y' // eslint-disable-line
+import * as Y from 'yjs' // eslint-disable-line
 import * as bc from 'lib0/broadcastchannel'
 import * as time from 'lib0/time'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import * as syncProtocol from '@y/protocols/sync'
-import * as authProtocol from '@y/protocols/auth'
-import * as awarenessProtocol from '@y/protocols/awareness'
+import * as syncProtocol from 'y-protocols/sync'
+import * as authProtocol from 'y-protocols/auth'
+import * as awarenessProtocol from 'y-protocols/awareness'
 import { ObservableV2 } from 'lib0/observable'
 import * as math from 'lib0/math'
 import * as url from 'lib0/url'
@@ -245,7 +245,7 @@ const broadcastMessage = (provider, buf) => {
  * creates a websocket connection to http://localhost:1234/my-document-name
  *
  * @example
- *   import * as Y from '@y/y'
+ *   import * as Y from 'yjs'
  *   import { WebsocketProvider } from 'y-websocket'
  *   const doc = new Y.Doc()
  *   const provider = new WebsocketProvider('http://localhost:1234', 'my-document-name', doc)
