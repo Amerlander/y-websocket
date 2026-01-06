@@ -5,7 +5,7 @@
  */
 
 // List of words that identify password-protected rooms
-// This should match the frontend's persistent_room_words list
+// This should match the frontend's special_room_words list
 const passwordProtectedRoomWords = [
   "zimmerpflanze",
   "sonnenaufgang",
@@ -54,7 +54,70 @@ const passwordProtectedRoomWords = [
   "horstplatz",
   "rehweide",
   "fuchsweg",
-  "eichenhain"
+  "eichenhain",
+  "kornfeld",
+  "moorsee",
+  "rosenbeet",
+  "bienenhaus",
+  "vogelhorst",
+  "wegekreuz",
+  "fliederbusch",
+  "ahornallee",
+  "rosenhain",
+  "wiesenpfad",
+  "grasweg",
+  "ackerfeld",
+  "feldstein",
+  "strandweg",
+  "meerblick",
+  "brandung",
+  "salzwiese",
+  "tangbank",
+  "fischerboot",
+  "hafenkai",
+  "lehmweg",
+  "tonofen",
+  "klinkerweg",
+  "backstein",
+  "schilfzone",
+  "reetdach",
+  "kletterwand",
+  "spielwiese",
+  "naturpfad",
+  "blumenrain",
+  "apfelhain",
+  "haselbusch",
+  "beerenstrauch",
+  "krautbeet",
+  "moospfad",
+  "abendschein",
+  "wassergraben",
+  "wellen",
+  "waldlicht",
+  "feldweg",
+  "gartenlaube",
+  "morgenrot",
+  "uferweg",
+  "holzsteg",
+  "birkenhain",
+  "erdpfad",
+  "moosbett",
+  "quellsee",
+  "quellbach",
+  "tidenhub",
+  "sandpfad",
+  "wildgarten",
+  "dornbusch",
+  "bachbett",
+  "seerosenteich",
+  "flutwelle",
+  "kieselweg",
+  "hanglage",
+  "feldtor",
+  "ackerweg",
+  "gartenbank",
+  "reis",
+  "tee"
 ]
 
 // Keep backward compatibility alias
@@ -114,11 +177,11 @@ const getMemoryUnloadAge = () => {
 
 /**
  * Get the max age for inactive rooms before permanent deletion from disk
- * Default: 90 days (3 months)
+ * Default: 30 days
  * @returns {number} Max age in milliseconds
  */
 const getMaxInactiveAge = () => {
-  const days = parseInt(process.env.MAX_INACTIVE_DAYS || '90')
+  const days = parseInt(process.env.MAX_INACTIVE_DAYS || '30')
   return days * 24 * 60 * 60 * 1000 // days to milliseconds
 }
 

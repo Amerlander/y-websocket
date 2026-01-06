@@ -116,7 +116,7 @@ ws://localhost:1234/roomName?type=admin&userId=xxx&persistent=true
 - No password protection
 
 ### Persistent Rooms
-- 4-5 word room names (first word from persistent_room_words)
+- 4-5 word room names (first word from special_room_words)
 - Data persisted in LevelDB
 - Optional password protection
 - Admin ownership tracked via `roomClaim`
