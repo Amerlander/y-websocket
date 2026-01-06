@@ -1,141 +1,173 @@
-# y-websocket :tophat:
-> WebSocket Provider for Yjs
+# Calliope Campus WebSocket Server
 
-The Websocket Provider implements a classical client server model. Clients
-connect to a single endpoint over Websocket. The server distributes awareness
-information and document updates among clients.
+Custom y-websocket server for Calliope Campus real-time collaboration.
 
-This repository contains a simple in-memory backend that can persist to
-databases, but it can't be scaled easily. The
-[y-redis](https://github.com/yjs/y-redis/) repository contains an alternative
-backend that is scalable, provides auth*, and can persist to different backends.
+## Overview
 
-The Websocket Provider is a solid choice if you want a central source that
-handles authentication and authorization. Websockets also send header
-information and cookies, so you can use existing authentication mechanisms with
-this server.
+This server handles real-time synchronization for collaborative coding rooms using YJS. It provides:
 
-* Supports cross-tab communication. When you open the same document in the same
-browser, changes on the document are exchanged via cross-tab communication
-([Broadcast
-Channel](https://developer.mozilla.org/en-US/docs/Web/API/Broadcast_Channel_API)
-and
-[localStorage](https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage)
-as fallback).
-* Supports exchange of awareness information (e.g. cursors).
+- **Room persistence**: Rooms are stored in LevelDB for durability
+- **Password protection**: Persistent rooms can require passwords
+- **Room management API**: REST endpoints for room operations
+- **Admin key verification**: Validates room ownership via PGP public keys
 
 ## Quick Start
 
-### Install dependencies
+### Development
 
-```sh
-npm i y-websocket
+```bash
+# From the project root
+cd scripts/server/y-websocket-dev
+
+# Start the server
+node bin/server.cjs
 ```
 
-### Start a y-websocket server
+Or use Docker:
 
-There are multiple y-websocket compatible backends for `y-websocket`: 
-
-* [@y/websocket-server](https://github.com/yjs/y-websocket-server/)
-* hocuspocus
-- y-sweet
-- y-redis
-- ypy-websocket
-- pycrdt-websocket
-- [yrs-warp](https://github.com/y-crdt/yrs-warp)
-- ...
-
-The fastest way to get started is to run the [@y/websocket-server](https://github.com/yjs/y-websocket-server/)
-backend. This package was previously included in y-websocket and now lives in a
-forkable repository.
-
-Install and start y-websocket-server:
-
-```sh
-npm install @y/websocket-server
-HOST=localhost PORT=1234 npx y-websocket
+```bash
+cd scripts/server
+docker-compose up
 ```
 
-### Client Code:
+### Environment Variables
 
-```js
-import * as Y from '@y/y'
-import { WebsocketProvider } from 'y-websocket'
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `localhost` | Server host |
+| `PORT` | `1234` | Server port |
+| `YPERSISTENCE` | `./yjs-data` | LevelDB persistence directory |
+| `GC` | `true` | Enable garbage collection |
 
-const doc = new Y.Doc()
-const wsProvider = new WebsocketProvider('ws://localhost:1234', 'my-roomname', doc)
+## API Endpoints
 
-wsProvider.on('status', event => {
-  console.log(event.status) // logs "connected" or "disconnected"
-})
-```
+### GET `/room/:roomName/info`
 
-#### Client Code in Node.js
+Get room metadata including existence, password status, and admin public key.
 
-The WebSocket provider requires a [`WebSocket`](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) object to create connection to a server. You can polyfill WebSocket support in Node.js using the [`ws` package](https://www.npmjs.com/package/ws).
-
-```js
-const wsProvider = new WebsocketProvider('ws://localhost:1234', 'my-roomname', doc, { WebSocketPolyfill: require('ws') })
-```
-
-## API
-
-```js
-import { WebsocketProvider } from 'y-websocket'
-```
-
-<dl>
-  <b><code>wsProvider = new WebsocketProvider(serverUrl: string, room: string, ydoc: Y.Doc [, wsOpts: WsOpts])</code></b>
-  <dd>Create a new websocket-provider instance. As long as this provider, or the connected ydoc, is not destroyed, the changes will be synced to other clients via the connected server. Optionally, you may specify a configuration object. The following default values of wsOpts can be overwritten. </dd>
-</dl>
-
-```js
-wsOpts = {
-  // Set this to `false` if you want to connect manually using wsProvider.connect()
-  connect: true,
-  // Specify a query-string / url parameters that will be url-encoded and attached to the `serverUrl`
-  // I.e. params = { auth: "bearer" } will be transformed to "?auth=bearer"
-  params: {}, // Object<string,string>
-  // You may polyill the Websocket object (https://developer.mozilla.org/en-US/docs/Web/API/WebSocket).
-  // E.g. In nodejs, you could specify WebsocketPolyfill = require('ws')
-  WebsocketPolyfill: Websocket,
-  // Specify an existing Awareness instance - see https://github.com/yjs/y-protocols
-  awareness: new awarenessProtocol.Awareness(ydoc),
-  // Specify the maximum amount to wait between reconnects (we use exponential backoff).
-  maxBackoffTime: 2500
+**Response:**
+```json
+{
+  "exists": true,
+  "isPersistent": true,
+  "hasPassword": true,
+  "connectionCount": 5,
+  "adminPublicKey": "-----BEGIN PGP PUBLIC KEY..."
 }
 ```
 
-<dl>
-  <b><code>wsProvider.wsconnected: boolean</code></b>
-  <dd>True if this instance is currently connected to the server.</dd>
-  <b><code>wsProvider.wsconnecting: boolean</code></b>
-  <dd>True if this instance is currently connecting to the server.</dd>
-  <b><code>wsProvider.shouldConnect: boolean</code></b>
-  <dd>If false, the client will not try to reconnect.</dd>
-  <b><code>wsProvider.bcconnected: boolean</code></b>
-  <dd>True if this instance is currently communicating to other browser-windows via BroadcastChannel.</dd>
-  <b><code>wsProvider.synced: boolean</code></b>
-  <dd>True if this instance is currently connected and synced with the server.</dd>
-  <b><code>wsProvider.params : boolean</code></b>
-  <dd>The specified url parameters. This can be safely updated, the new values
-    will be used when a new connction is established. If this contains an
-    auth token, it should be updated regularly.</dd>
-  <b><code>wsProvider.disconnect()</code></b>
-  <dd>Disconnect from the server and don't try to reconnect.</dd>
-  <b><code>wsProvider.connect()</code></b>
-  <dd>Establish a websocket connection to the websocket-server. Call this if you recently disconnected or if you set wsOpts.connect = false.</dd>
-  <b><code>wsProvider.destroy()</code></b>
-  <dd>Destroy this wsProvider instance. Disconnects from the server and removes all event handlers.</dd>
-  <b><code>wsProvider.on('sync', function(isSynced: boolean))</code></b>
-  <dd>Add an event listener for the sync event that is fired when the client received content from the server.</dd>
-  <b><code>wsProvider.on('status', function({ status: 'disconnected' | 'connecting' | 'connected' }))</code></b>
-  <dd>Receive updates about the current connection status.</dd>
-  <b><code>wsProvider.on('connection-close', function(WSClosedEvent))</code></b>
-  <dd>Fires when the underlying websocket connection is closed. It forwards the websocket event to this event handler.</dd>
-  <b><code>wsProvider.on('connection-error', function(WSErrorEvent))</code></b>
-  <dd>Fires when the underlying websocket connection closes with an error. It forwards the websocket event to this event handler.</dd>
-</dl>
+### POST `/room/:roomName/verify-password`
+
+Verify a password for a room.
+
+**Request:**
+```json
+{
+  "password": "secret123"
+}
+```
+
+**Response:**
+```json
+{
+  "valid": true
+}
+```
+
+### DELETE `/room/:roomName`
+
+Delete a room (requires password if room is password-protected).
+
+**Request:**
+```json
+{
+  "password": "secret123"
+}
+```
+
+## WebSocket Protocol
+
+The server uses the standard y-websocket protocol with extensions:
+
+### Connection URL Format
+
+```
+ws://localhost:1234/roomName?type=admin&userId=xxx&persistent=true
+```
+
+**Query Parameters:**
+- `type`: User type (`admin` or `user`)
+- `userId`: Unique user identifier
+- `persistent`: Whether this is a persistent room
+
+### Close Codes
+
+| Code | Meaning |
+|------|---------|
+| `4001` | Invalid password |
+| `4010` | Room is being deleted |
+| `4403` | Access denied |
+
+## Room Types
+
+### Regular Rooms
+- 4-word room names from german_words
+- No persistence after all users leave
+- No password protection
+
+### Persistent Rooms
+- 4-5 word room names (first word from persistent_room_words)
+- Data persisted in LevelDB
+- Optional password protection
+- Admin ownership tracked via `roomClaim`
+
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│           WebSocket Server              │
+│  ┌─────────────────────────────────────┐│
+│  │    REST API (room management)      ││
+│  └─────────────────────────────────────┘│
+│  ┌─────────────────────────────────────┐│
+│  │    WebSocket Handler (y-websocket) ││
+│  └─────────────────────────────────────┘│
+│  ┌─────────────────────────────────────┐│
+│  │    LevelDB Persistence             ││
+│  └─────────────────────────────────────┘│
+└─────────────────────────────────────────┘
+```
+
+## Security
+
+### Room Ownership (roomClaim)
+
+When an admin creates a room, their PGP public key is stored in the room's `roomClaim`. This prevents other keys (that might hash to the same room URL) from taking over the room.
+
+### Password Hashing
+
+Room passwords are hashed using SHA-256 before comparison. The hash is stored in memory and in the persisted room data.
+
+## Development
+
+### File Structure
+
+```
+bin/
+├── server.cjs          # Main HTTP + WebSocket server
+├── utils.cjs           # YJS document handling
+├── room-auth.cjs       # Password hashing/verification
+├── persistent-rooms.cjs # Room persistence logic
+└── callback.cjs        # Optional webhook callbacks
+```
+
+### Adding New Endpoints
+
+Add new routes in `server.cjs` in the HTTP request handler section.
+
+## Based On
+
+This server is based on [y-websocket](https://github.com/yjs/y-websocket) with custom extensions for Calliope Campus.
 
 ## License
 
