@@ -1,7 +1,7 @@
 /**
  * Room cleanup scheduler
- * Periodically cleans up inactive persistent rooms:
- * 1. Compact document state to reduce storage (removes edit history)
+ * Periodically cleans up inactive rooms:
+ * 1. Compact document state to reduce storage
  * 2. Unload from memory after MEMORY_UNLOAD_DAYS (default: 3 days)
  * 3. Delete from disk after MAX_INACTIVE_DAYS (default: 30 days)
  */
@@ -77,54 +77,43 @@ export const initCleanupScheduler = (docs, persistence) => {
     for (const [docName, doc] of docs.entries()) {
       checkedCount++
       
-      // Only process persistent rooms
-      if (doc.isPersistent && doc.conns.size === 0) {
+      // Only process rooms with no connections
+      if (doc.conns.size === 0) {
         const inactiveDays = Math.floor((now - doc.lastAccessed) / (1000 * 60 * 60 * 24))
         
         // Check if room should be deleted from disk (oldest threshold)
         if (doc.lastAccessed < diskCutoffTime) {
-          console.log(`🗑️  Deleting persistent room from disk: "${docName}" (last accessed ${inactiveDays} days ago)`)
+          console.log(`🗑️ Deleting room: "${docName}" (inactive ${inactiveDays} days)`)
           
-          // Delete from disk if persistence is enabled
           if (persistence !== null) {
             persistence.provider.clearDocument(docName)
-              .then(() => {
-                console.log(`✅ Successfully deleted room "${docName}" from disk`)
-              })
-              .catch(err => {
-                console.error(`❌ Error deleting room "${docName}" from disk:`, err)
-              })
+              .then(() => console.log(`✅ Deleted "${docName}" from disk`))
+              .catch(err => console.error(`❌ Error deleting "${docName}":`, err))
           }
           
-          // Remove from memory
           doc.destroy()
           docs.delete(docName)
           deletedCount++
         }
         // Check if room should be unloaded from memory (but kept on disk)
         else if (doc.lastAccessed < memoryCutoffTime) {
-          console.log(`💾 Compacting & unloading: "${docName}" (last accessed ${inactiveDays} days ago)`)
+          console.log(`💾 Compacting: "${docName}" (inactive ${inactiveDays} days)`)
           
-          // Compact the document before unloading to save disk space
           if (persistence !== null) {
             try {
               await compactDocument(docName, doc, persistence)
               compactedCount++
-              
               await persistence.writeState(docName, doc)
               doc.destroy()
               docs.delete(docName)
               unloadedCount++
-              console.log(`✅ Successfully compacted and unloaded room "${docName}"`)
             } catch (err) {
-              console.error(`❌ Error processing room "${docName}":`, err)
-              // Unload anyway even if compaction/persistence fails
+              console.error(`❌ Error compacting "${docName}":`, err)
               doc.destroy()
               docs.delete(docName)
               unloadedCount++
             }
           } else {
-            // No persistence, just remove from memory
             doc.destroy()
             docs.delete(docName)
             unloadedCount++
@@ -133,7 +122,7 @@ export const initCleanupScheduler = (docs, persistence) => {
       }
     }
     
-    console.log(`✅ Cleanup completed: checked ${checkedCount} rooms, compacted ${compactedCount}, unloaded ${unloadedCount} from memory, deleted ${deletedCount} from disk\n`)
+    console.log(`✅ Cleanup: ${checkedCount} checked, ${compactedCount} compacted, ${unloadedCount} unloaded, ${deletedCount} deleted\n`)
   }
 
   // Run cleanup immediately on startup (to clean up any leftover rooms from previous runs)

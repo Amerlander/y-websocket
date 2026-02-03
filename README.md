@@ -110,15 +110,17 @@ ws://localhost:1234/roomName?type=admin&userId=xxx&persistent=true
 
 ## Room Types
 
-### Regular Rooms
-- 4-word room names from german_words
-- No persistence after all users leave
-- No password protection
+All rooms are now persistent by default.
 
-### Persistent Rooms
-- 4-5 word room names (first word from special_room_words)
-- Data persisted in LevelDB
-- Optional password protection
+### Room Name Format
+- All rooms use 5-word names from german_words
+- Room name is derived solely from the PGP public key
+- Password protection is independent of room name
+
+### Password Protection
+- Password is stored as a hash on the server
+- Password can be changed without affecting room name
+- Server blocks communication until valid password is provided
 - Admin ownership tracked via `roomClaim`
 
 ## Architecture

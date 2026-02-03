@@ -1,192 +1,191 @@
+/**
+ * Y-WebSocket Server Utilities
+ * Simplified implementation for document synchronization
+ */
+
 import * as Y from 'yjs'
 import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
-
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import * as map from 'lib0/map'
-
 import debounce from 'lodash.debounce'
 
 import { callbackHandler, isCallbackSet } from './callback.js'
-import { isPersistentRoom, getCleanupInterval, getMaxInactiveAge } from './persistent-rooms.js'
-import { parseRoomConnection, verifyPassword } from './room-auth.js'
+import { verifyPassword, hashPassword } from './room-auth.js'
 
+// Constants
 const CALLBACK_DEBOUNCE_WAIT = parseInt(process.env.CALLBACK_DEBOUNCE_WAIT || '2000')
 const CALLBACK_DEBOUNCE_MAXWAIT = parseInt(process.env.CALLBACK_DEBOUNCE_MAXWAIT || '10000')
+const WS_READY_STATE_OPEN = 1
+const MESSAGE_SYNC = 0
+const MESSAGE_AWARENESS = 1
+const PING_TIMEOUT = 30000
+const PASSWORD_AUTH_TIMEOUT = 5000
 
-const wsReadyStateConnecting = 0
-const wsReadyStateOpen = 1
-
-// disable gc when using snapshots!
+// GC enabled by default
 const gcEnabled = process.env.GC !== 'false' && process.env.GC !== '0'
+
+// Persistence setup
 const persistenceDir = process.env.YPERSISTENCE
-/**
- * @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
- */
+/** @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null} */
 let persistence = null
+
 if (typeof persistenceDir === 'string') {
-  console.info('📦 Persisting documents to "' + persistenceDir + '"')
-  // Dynamic import for y-leveldb (CommonJS module)
+  console.info(`📦 Persisting documents to "${persistenceDir}"`)
   const { LeveldbPersistence } = await import('y-leveldb')
   const ldb = new LeveldbPersistence(persistenceDir)
+  
   persistence = {
     provider: ldb,
     bindState: async (docName, ydoc) => {
-      console.log(`🔗 [${docName}] Binding persistence...`)
       const persistedYdoc = await ldb.getYDoc(docName)
       const newUpdates = Y.encodeStateAsUpdate(ydoc)
       ldb.storeUpdate(docName, newUpdates)
       Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc))
       console.log(`✅ [${docName}] Loaded persisted state`)
       
-      let updateCount = 0
+      // Read password hash from persisted roomSettings if exists
+      readPasswordFromDoc(ydoc)
+      
       ydoc.on('update', update => {
-        updateCount++
         ldb.storeUpdate(docName, update)
-        console.log(`💾 [${docName}] Update #${updateCount} persisted (${update.length} bytes)`)
       })
     },
     writeState: async (_docName, _ydoc) => {}
   }
 }
 
-/**
- * @param {{bindState: function(string,WSSharedDoc):void,
- * writeState:function(string,WSSharedDoc):Promise<any>,provider:any}|null} persistence_
- */
-export const setPersistence = persistence_ => {
-  persistence = persistence_
-}
+/** @param {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>,provider:any}|null} p */
+export const setPersistence = p => { persistence = p }
 
-/**
- * @return {null|{bindState: function(string,WSSharedDoc):void,
-  * writeState:function(string,WSSharedDoc):Promise<any>}|null} used persistence layer
-  */
 export const getPersistence = () => persistence
 
-/**
- * @type {Map<string,WSSharedDoc>}
- */
+/** @type {Map<string,WSSharedDoc>} */
 export const docs = new Map()
 
-const messageSync = 0
-const messageAwareness = 1
-
 /**
- * @param {Uint8Array} update
- * @param {any} _origin
- * @param {WSSharedDoc} doc
- * @param {any} _tr
+ * Read password hash from YJS document's roomSettings map.
+ * This is called when loading a room from persistence.
+ * @param {WSSharedDoc} ydoc
  */
-const updateHandler = (update, _origin, doc, _tr) => {
-  const encoder = encoding.createEncoder()
-  encoding.writeVarUint(encoder, messageSync)
-  syncProtocol.writeUpdate(encoder, update)
-  const message = encoding.toUint8Array(encoder)
-  doc.conns.forEach((_, conn) => send(doc, conn, message))
-}
-
-/**
- * @type {(ydoc: Y.Doc) => Promise<void>}
- */
-let contentInitializor = _ydoc => Promise.resolve()
-
-/**
- * This function is called once every time a Yjs document is created. You can
- * use it to pull data from an external source or initialize content.
- *
- * @param {(ydoc: Y.Doc) => Promise<void>} f
- */
-export const setContentInitializor = (f) => {
-  contentInitializor = f
-}
-
-export class WSSharedDoc extends Y.Doc {
-  /**
-   * @param {string} name
-   */
-  constructor (name) {
-    super({ gc: gcEnabled })
-    this.name = name
-    /**
-     * Maps from conn to set of controlled user ids. Delete all user ids from awareness when this conn is closed
-     * @type {Map<Object, Set<number>>}
-     */
-    this.conns = new Map()
-    /**
-     * @type {awarenessProtocol.Awareness}
-     */
-    this.awareness = new awarenessProtocol.Awareness(this)
-    this.awareness.setLocalState(null)
-    /**
-     * Timestamp of last access to this room
-     * @type {number}
-     */
-    this.lastAccessed = Date.now()
-    /**
-     * Whether this is a persistent room (should not be deleted when empty)
-     * @type {boolean}
-     */
-    this.isPersistent = isPersistentRoom(name)
-    /**
-     * Password hash for persistent rooms (set by admin on first connection)
-     * @type {string|null}
-     */
-    this.passwordHash = null
-    /**
-     * @param {{ added: Array<number>, updated: Array<number>, removed: Array<number> }} changes
-     * @param {Object | null} conn Origin is the connection that made the change
-     */
-    const awarenessChangeHandler = ({ added, updated, removed }, conn) => {
-      const changedClients = added.concat(updated, removed)
-      if (conn !== null) {
-        const connControlledIDs = /** @type {Set<number>} */ (this.conns.get(conn))
-        if (connControlledIDs !== undefined) {
-          added.forEach(clientID => { connControlledIDs.add(clientID) })
-          removed.forEach(clientID => { connControlledIDs.delete(clientID) })
+function readPasswordFromDoc(ydoc) {
+  try {
+    const roomSettingsMap = ydoc.getMap('roomSettings')
+    const storedPasswordHash = roomSettingsMap?.get('passwordHash')
+    if (storedPasswordHash && typeof storedPasswordHash === 'string') {
+      ydoc.passwordHash = storedPasswordHash
+      console.log(`🔒 [${ydoc.name}] Password protection loaded from document`)
+    }
+    
+    // Also listen for password hash changes
+    roomSettingsMap.observe((event) => {
+      if (event.keysChanged.has('passwordHash')) {
+        const newHash = roomSettingsMap.get('passwordHash')
+        if (newHash && typeof newHash === 'string') {
+          ydoc.passwordHash = newHash
+          console.log(`🔒 [${ydoc.name}] Password hash updated`)
+        } else if (!newHash) {
+          ydoc.passwordHash = null
+          console.log(`🔓 [${ydoc.name}] Password protection removed`)
         }
       }
-      // broadcast awareness update
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageAwareness)
-      encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients))
-      const buff = encoding.toUint8Array(encoder)
-      this.conns.forEach((_, c) => {
-        send(this, c, buff)
-      })
-    }
-    this.awareness.on('update', awarenessChangeHandler)
-    this.on('update', /** @type {any} */ (updateHandler))
-    if (isCallbackSet) {
-      this.on('update', /** @type {any} */ (debounce(
-        callbackHandler,
-        CALLBACK_DEBOUNCE_WAIT,
-        { maxWait: CALLBACK_DEBOUNCE_MAXWAIT }
-      )))
-    }
-    this.whenInitialized = contentInitializor(this)
+    })
+  } catch (e) {
+    console.warn(`⚠️ [${ydoc.name}] Could not read password from document:`, e.message)
   }
 }
 
 /**
- * Gets a Y.Doc by name, whether in memory or on disk
- *
- * @param {string} docname - the name of the Y.Doc to find or create
- * @param {boolean} gc - whether to allow gc on the doc (applies only when created)
- * @return {WSSharedDoc}
+ * Persist password hash to YJS document's roomSettings map.
+ * This ensures the password survives server restarts.
+ * @param {WSSharedDoc} ydoc
+ * @param {string|null} passwordHash
+ */
+function persistPasswordHashToDoc(ydoc, passwordHash) {
+  try {
+    const roomSettingsMap = ydoc.getMap('roomSettings')
+    if (passwordHash) {
+      roomSettingsMap.set('passwordHash', passwordHash)
+      console.log(`💾 [${ydoc.name}] Password hash persisted to document`)
+    } else {
+      roomSettingsMap.delete('passwordHash')
+      console.log(`💾 [${ydoc.name}] Password hash removed from document`)
+    }
+  } catch (e) {
+    console.error(`❌ [${ydoc.name}] Failed to persist password hash:`, e.message)
+  }
+}
+
+/**
+ * Shared YJS document with awareness and connection tracking
+ */
+export class WSSharedDoc extends Y.Doc {
+  /** @param {string} name */
+  constructor(name) {
+    super({ gc: gcEnabled })
+    this.name = name
+    /** @type {Map<Object, Set<number>>} */
+    this.conns = new Map()
+    this.awareness = new awarenessProtocol.Awareness(this)
+    this.awareness.setLocalState(null)
+    /** @type {number} */
+    this.lastAccessed = Date.now()
+    /** @type {string|null} */
+    this.passwordHash = null
+    /** @type {Promise<void>|null} Promise that resolves when state is loaded from persistence */
+    this._stateLoading = null
+
+    // Awareness change handler
+    this.awareness.on('update', /** @param {{ added: number[], updated: number[], removed: number[] }} changes @param {any} conn */ ({ added, updated, removed }, conn) => {
+      const changedClients = [...added, ...updated, ...removed]
+      if (conn !== null) {
+        const controlledIDs = this.conns.get(conn)
+        if (controlledIDs) {
+          added.forEach(id => controlledIDs.add(id))
+          removed.forEach(id => controlledIDs.delete(id))
+        }
+      }
+      // Broadcast awareness update
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+      encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients))
+      const buff = encoding.toUint8Array(encoder)
+      this.conns.forEach((_, c) => send(this, c, buff))
+    })
+
+    // Document update handler
+    this.on('update', /** @type {any} */ (update, _origin, doc) => {
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_SYNC)
+      syncProtocol.writeUpdate(encoder, update)
+      const message = encoding.toUint8Array(encoder)
+      doc.conns.forEach((_, conn) => send(doc, conn, message))
+    })
+
+    // Optional callback handler
+    if (isCallbackSet) {
+      this.on('update', /** @type {any} */ debounce(callbackHandler, CALLBACK_DEBOUNCE_WAIT, { maxWait: CALLBACK_DEBOUNCE_MAXWAIT }))
+    }
+  }
+}
+
+/**
+ * Get or create a document
+ * @param {string} docname
+ * @param {boolean} gc
+ * @returns {WSSharedDoc}
  */
 export const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
+  /** @type {Promise<void>|null} */
+  doc._stateLoading = null
+  console.log(`📄 [${docname}] Document created`)
   
-  const persistentIcon = doc.isPersistent ? '🔒' : '🔓'
-  console.log(`${persistentIcon} [${docname}] Creating document (persistent: ${doc.isPersistent})`)
-  
-  if (persistence !== null) {
-    persistence.bindState(docname, doc)
-  } else {
-    console.log(`⚠️  [${docname}] No persistence configured - data will be lost on restart!`)
+  if (persistence) {
+    // Store the promise so connections can wait for it
+    doc._stateLoading = persistence.bindState(docname, doc)
   }
   
   docs.set(docname, doc)
@@ -194,6 +193,49 @@ export const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname,
 })
 
 /**
+ * Send message to connection
+ * @param {WSSharedDoc} doc
+ * @param {import('ws').WebSocket} conn
+ * @param {Uint8Array} message
+ */
+const send = (doc, conn, message) => {
+  if (conn.readyState !== WS_READY_STATE_OPEN) {
+    closeConn(doc, conn)
+    return
+  }
+  try {
+    conn.send(message, {}, err => { if (err) closeConn(doc, conn) })
+  } catch (e) {
+    closeConn(doc, conn)
+  }
+}
+
+/**
+ * Close connection and cleanup
+ * @param {WSSharedDoc} doc
+ * @param {any} conn
+ */
+const closeConn = (doc, conn) => {
+  if (doc.conns.has(conn)) {
+    const controlledIds = doc.conns.get(conn)
+    doc.conns.delete(conn)
+    awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds || []), null)
+    
+    if (doc.conns.size === 0) {
+      doc.lastAccessed = Date.now()
+      if (persistence) {
+        persistence.writeState(doc.name, doc).catch(err => {
+          console.error(`Error persisting document ${doc.name}:`, err)
+        })
+      }
+      console.log(`💾 [${doc.name}] Persisted (no connections)`)
+    }
+  }
+  try { conn.close() } catch (e) { /* ignore */ }
+}
+
+/**
+ * Handle incoming messages
  * @param {any} conn
  * @param {WSSharedDoc} doc
  * @param {Uint8Array} message
@@ -203,387 +245,204 @@ const messageListener = (conn, doc, message) => {
     const encoder = encoding.createEncoder()
     const decoder = decoding.createDecoder(message)
     const messageType = decoding.readVarUint(decoder)
-    switch (messageType) {
-      case messageSync:
-        // SECURITY: Only allow sync if authenticated (or no password required)
-        if (conn._roomAuth && conn._roomAuth.authenticated) {
-          encoding.writeVarUint(encoder, messageSync)
-          syncProtocol.readSyncMessage(decoder, encoder, doc, conn)
 
-          // Only send reply if there's actual content (length > 1 means more than just message type)
+    switch (messageType) {
+      case MESSAGE_SYNC:
+        // Only sync if authenticated
+        if (conn._auth?.authenticated) {
+          encoding.writeVarUint(encoder, MESSAGE_SYNC)
+          syncProtocol.readSyncMessage(decoder, encoder, doc, conn)
           if (encoding.length(encoder) > 1) {
             send(doc, conn, encoding.toUint8Array(encoder))
           }
-        } else {
-          console.warn(`❌ Sync attempt from unauthenticated connection to room "${doc.name}"`)
         }
         break
-      case messageAwareness: {
+
+      case MESSAGE_AWARENESS: {
         const awarenessUpdate = decoding.readVarUint8Array(decoder)
         
-        // ====================================================================
-        // SECURITY: ROOM CREATION AUTHORIZATION
-        // For persistent password-protected rooms that don't exist yet,
-        // we must verify the user's type before deciding to create or reject
-        // ====================================================================
-        if (conn._roomAuth && conn._roomAuth.pendingRoomCreation) {
-          const decodedAwareness = awarenessProtocol.decodeAwarenessUpdate(awarenessUpdate)
-          const clients = decodedAwareness.clients
-          
-          // Extract user type and password from awareness state
-          let userType = null
-          let userPassword = null
-          
-          for (const [clientID, state] of Object.entries(clients)) {
-            if (state && state.user) {
-              userType = state.user.type // 'admin' or 'user'
-              userPassword = state._roomPassword
-              break
-            }
-          }
-          
-          // ADMIN PATH: Create the room
-          if (userType === 'admin') {
-            console.log(`✅ Admin creating password-protected room "${conn._roomAuth.roomName}"`)
-            
-            // Create the actual persistent document
-            const actualDoc = getYDoc(conn._roomAuth.roomName, doc.gc)
-            actualDoc.passwordHash = conn._roomAuth.passwordHash
-            
-            // Transfer connection from temp doc to actual doc
-            doc.conns.delete(conn)
-            actualDoc.conns.set(conn, new Set())
-            
-            // Update auth state
-            conn._roomAuth.pendingRoomCreation = false
-            conn._roomAuth.authenticated = false // Will be set after password verification
-            
-            // Apply awareness to the real doc
-            awarenessProtocol.applyAwarenessUpdate(actualDoc.awareness, awarenessUpdate, conn)
-            
-            console.log(`✅ Room "${conn._roomAuth.roomName}" created with password protection`)
-            
-            // Verify the admin's password
-            if (userPassword && actualDoc.passwordHash) {
-              if (verifyPassword(userPassword, actualDoc.passwordHash)) {
-                conn._roomAuth.authenticated = true
-                conn._roomAuth.passwordVerified = true
-                console.log(`✅ Admin authenticated for room "${actualDoc.name}"`)
-              } else {
-                console.warn(`❌ Invalid password from admin for room "${actualDoc.name}"`)
-                conn.close(4002, 'Invalid password for this room.')
-                return
-              }
-            }
-            
-            return
-          } 
-          
-          // USER PATH: Reject (room doesn't exist = probably wrong password)
-          else {
-            console.warn(`❌ User attempted to access non-existent room "${conn._roomAuth.roomName}"`)
-            conn.close(4001, 'This password-protected room does not exist. You may have the wrong password, or an admin needs to create this room first.')
-            return
-          }
+        // Helper to extract states from awareness update without applying to main awareness
+        const extractAwarenessStates = (update) => {
+          // Create a temporary awareness to decode the update
+          const tempDoc = new Y.Doc()
+          const tempAwareness = new awarenessProtocol.Awareness(tempDoc)
+          awarenessProtocol.applyAwarenessUpdate(tempAwareness, update, null)
+          const states = tempAwareness.getStates()
+          tempDoc.destroy()
+          return states
         }
         
-        // ====================================================================
-        // SECURITY: PASSWORD VERIFICATION FOR EXISTING ROOMS
-        // Verify password if room requires it and connection not yet authenticated
-        // ====================================================================
-        if (doc.passwordHash && conn._roomAuth && !conn._roomAuth.authenticated) {
-          const decodedAwareness = awarenessProtocol.decodeAwarenessUpdate(awarenessUpdate)
-          const clients = decodedAwareness.clients
+        // Password verification for protected rooms
+        if (doc.passwordHash && conn._auth && !conn._auth.authenticated) {
+          const states = extractAwarenessStates(awarenessUpdate)
           
-          // Check if awareness contains password
-          let passwordVerified = false
-          for (const [clientID, state] of Object.entries(clients)) {
-            if (state && state._roomPassword) {
-              // Verify password using constant-time comparison
+          for (const [, state] of states.entries()) {
+            if (state?._roomPassword) {
               if (verifyPassword(state._roomPassword, doc.passwordHash)) {
-                conn._roomAuth.authenticated = true
-                conn._roomAuth.passwordVerified = true
-                passwordVerified = true
-                console.log(`✅ Connection authenticated for room "${doc.name}"`)
+                conn._auth.authenticated = true
+                clearTimeout(conn._auth.timeout)
+                console.log(`✅ [${doc.name}] Connection authenticated`)
+                
+                // Send initial sync after authentication
+                sendInitialSync(doc, conn)
                 break
               } else {
-                console.warn(`❌ Invalid password attempt for room "${doc.name}"`)
-                conn.close(4002, 'Invalid password for this room.')
+                console.warn(`❌ [${doc.name}] Invalid password`)
+                conn.close(4002, 'Invalid password')
                 return
               }
             }
           }
           
-          // Reject if still not authenticated after awareness update
-          if (!passwordVerified) {
-            console.warn(`❌ Awareness update without password for protected room "${doc.name}"`)
-            return
+          // If still not authenticated, check for admin creating room with password
+          if (!conn._auth.authenticated) {
+            for (const [, state] of states.entries()) {
+              if (state?.user?.type === 'admin' && state?._roomPassword) {
+                // Admin setting password for new room
+                const newPasswordHash = hashPassword(state._roomPassword)
+                doc.passwordHash = newPasswordHash
+                
+                // Persist password hash to YJS document so it survives server restarts
+                persistPasswordHashToDoc(doc, newPasswordHash)
+                
+                conn._auth.authenticated = true
+                clearTimeout(conn._auth.timeout)
+                console.log(`🔒 [${doc.name}] Room password set by admin and persisted`)
+                sendInitialSync(doc, conn)
+                break
+              }
+            }
+          }
+          
+          if (!conn._auth.authenticated) {
+            return // Wait for password
           }
         }
         
-        // Apply awareness update (only if authenticated or no password required)
-        if (!doc.passwordHash || (conn._roomAuth && conn._roomAuth.authenticated)) {
+        // Apply awareness if authenticated
+        if (!doc.passwordHash || conn._auth?.authenticated) {
+          // Check if an authenticated admin is setting/updating the password
+          const states = extractAwarenessStates(awarenessUpdate)
+          for (const [, state] of states.entries()) {
+            if (state?.user?.type === 'admin' && state?._roomPassword && conn._auth?.authenticated) {
+              const newPasswordHash = hashPassword(state._roomPassword)
+              // Only update if password changed
+              if (newPasswordHash !== doc.passwordHash) {
+                doc.passwordHash = newPasswordHash
+                persistPasswordHashToDoc(doc, newPasswordHash)
+                console.log(`🔒 [${doc.name}] Password updated by authenticated admin`)
+              }
+            }
+          }
+          
           awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn)
         }
         break
       }
     }
   } catch (err) {
-    console.error(err)
+    console.error('Message handling error:', err)
     // @ts-ignore
     doc.emit('error', [err])
   }
 }
 
 /**
- * Closes a connection and cleans up the document if no connections remain
- * 
- * PERSISTENT ROOMS: Kept in memory, persisted to disk
- * NON-PERSISTENT ROOMS: Destroyed when last connection closes
- * 
+ * Send initial sync state to connection
  * @param {WSSharedDoc} doc
  * @param {any} conn
  */
-const closeConn = (doc, conn) => {
-  if (doc.conns.has(conn)) {
-    // Remove awareness states controlled by this connection
-    const controlledIds = /** @type {Set<number>} */ (doc.conns.get(conn))
-    doc.conns.delete(conn)
-    awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds), null)
-    
-    // Handle cleanup if no connections remain
-    if (doc.conns.size === 0) {
-      doc.lastAccessed = Date.now()
-      
-      if (doc.isPersistent) {
-        // PERSISTENT ROOM: Keep in memory, persist to disk
-        if (persistence !== null) {
-          persistence.writeState(doc.name, doc).catch(err => {
-            console.error('Error persisting document:', err)
-          })
-        }
-        console.log(`💾 Persistent room "${doc.name}" persisted (last accessed: ${new Date(doc.lastAccessed).toISOString()})`)
-      } else {
-        // NON-PERSISTENT ROOM: Destroy and remove from memory
-        if (persistence !== null) {
-          persistence.writeState(doc.name, doc).then(() => {
-            doc.destroy()
-          })
-          docs.delete(doc.name)
-        }
-      }
-    }
-  }
-  conn.close()
-}
-
-/**
- * @param {WSSharedDoc} doc
- * @param {import('ws').WebSocket} conn
- * @param {Uint8Array} m
- */
-const send = (doc, conn, m) => {
-  if (conn.readyState !== wsReadyStateConnecting && conn.readyState !== wsReadyStateOpen) {
-    closeConn(doc, conn)
-  }
-  try {
-    conn.send(m, {}, err => { err != null && closeConn(doc, conn) })
-  } catch (e) {
-    closeConn(doc, conn)
+const sendInitialSync = (doc, conn) => {
+  // Send sync step 1
+  const encoder = encoding.createEncoder()
+  encoding.writeVarUint(encoder, MESSAGE_SYNC)
+  syncProtocol.writeSyncStep1(encoder, doc)
+  send(doc, conn, encoding.toUint8Array(encoder))
+  
+  // Send awareness states
+  const awarenessStates = doc.awareness.getStates()
+  if (awarenessStates.size > 0) {
+    const awarenessEncoder = encoding.createEncoder()
+    encoding.writeVarUint(awarenessEncoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(awarenessEncoder, awarenessProtocol.encodeAwarenessUpdate(
+      doc.awareness,
+      Array.from(awarenessStates.keys())
+    ))
+    send(doc, conn, encoding.toUint8Array(awarenessEncoder))
   }
 }
 
-const pingTimeout = 30000
-
 /**
- * Sets up a WebSocket connection for collaborative editing
- * 
- * FLOW:
- * 1. Parse room name and password hash from URL
- * 2. For new password-protected rooms: Wait for user type verification (admin vs user)
- * 3. For existing rooms: Verify password in awareness
- * 4. Setup ping/pong for connection health
- * 5. Send initial sync
- * 
+ * Setup WebSocket connection
  * @param {import('ws').WebSocket} conn
  * @param {import('http').IncomingMessage} req
  * @param {any} opts
  */
-export const setupWSConnection = (conn, req, { docName = (req.url || '').slice(1).split('?')[0], gc = true } = {}) => {
+export const setupWSConnection = async (conn, req, { docName = (req.url || '').slice(1).split('?')[0], gc = true } = {}) => {
   conn.binaryType = 'arraybuffer'
   
-  // ====================================================================
-  // STEP 1: PARSE CONNECTION INFO
-  // ====================================================================
-  const { roomName, passwordHash } = parseRoomConnection(docName)
-  const existingDoc = docs.get(roomName)
-  const isPersistent = isPersistentRoom(roomName)
-  
-  // ====================================================================
-  // STEP 2: HANDLE NON-EXISTENT PASSWORD-PROTECTED ROOMS
-  // Wait for user type to decide: admin creates, user gets rejected
-  // ====================================================================
-  if (isPersistent && passwordHash && !existingDoc) {
-    console.log(`⏳ Password-protected room "${roomName}" pending user verification`)
-    
-    conn._roomAuth = {
-      authenticated: false,
-      passwordVerified: false,
-      pendingRoomCreation: true,
-      roomName: roomName,
-      passwordHash: passwordHash
-    }
-    
-    // Create temporary doc to receive awareness
-    const tempDoc = new WSSharedDoc(roomName)
-    tempDoc.gc = gc
-    tempDoc.conns.set(conn, new Set())
-    
-    // Handle messages (will check user type in messageListener)
-    conn.on('message', /** @param {ArrayBuffer} message */ message => {
-      if (conn._roomAuth && conn._roomAuth.pendingRoomCreation) {
-        messageListener(conn, tempDoc, new Uint8Array(message))
-      } else {
-        const actualDoc = docs.get(roomName)
-        if (actualDoc) {
-          messageListener(conn, actualDoc, new Uint8Array(message))
-        }
-      }
-    })
-    
-    // Setup connection health monitoring
-    let pongReceived = true
-    const pingInterval = setInterval(() => {
-      if (!pongReceived) {
-        const actualDoc = docs.get(roomName) || tempDoc
-        closeConn(actualDoc, conn)
-        clearInterval(pingInterval)
-      } else {
-        const actualDoc = docs.get(roomName)
-        if (tempDoc.conns.has(conn) || (actualDoc && actualDoc.conns.has(conn))) {
-          pongReceived = false
-          try {
-            conn.ping()
-          } catch (e) {
-            closeConn(actualDoc || tempDoc, conn)
-            clearInterval(pingInterval)
-          }
-        }
-      }
-    }, pingTimeout)
-    
-    conn.on('close', () => {
-      closeConn(docs.get(roomName) || tempDoc, conn)
-      clearInterval(pingInterval)
-    })
-    
-    conn.on('pong', () => {
-      pongReceived = true
-    })
-    
-    // Send initial sync
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, messageSync)
-    syncProtocol.writeSyncStep1(encoder, tempDoc)
-    send(tempDoc, conn, encoding.toUint8Array(encoder))
-    
-    return
-  }
-  
-  // ====================================================================
-  // STEP 3: GET OR CREATE DOCUMENT
-  // ====================================================================
+  const roomName = docName
   const doc = getYDoc(roomName, gc)
+  doc.lastAccessed = Date.now()
   
-  // ====================================================================
-  // STEP 4: PASSWORD HASH SECURITY
-  // Password can only be set on room creation, never changed (immutable)
-  // ====================================================================
-  if (doc.isPersistent && passwordHash) {
-    if (!doc.passwordHash) {
-      // New room: Set password hash
-      const isNewRoom = doc.conns.size === 0
-      
-      if (isNewRoom) {
-        doc.passwordHash = passwordHash
-        console.log(`🔒 Room "${roomName}" initialized with password protection`)
-      } else {
-        console.warn(`❌ Attempt to add password to existing room "${roomName}"`)
-        conn.close(4003, 'Cannot add password to existing room.')
-        return
-      }
-    } else if (doc.passwordHash !== passwordHash) {
-      // Password hash mismatch
-      console.warn(`❌ Password hash mismatch for room "${roomName}"`)
-      conn.close(4004, 'Password hash mismatch - room was created with different password.')
-      return
+  // Wait for document state to be loaded from persistence (including password hash)
+  if (doc._stateLoading) {
+    try {
+      await doc._stateLoading
+    } catch (e) {
+      console.error(`Error loading document state for ${roomName}:`, e)
     }
   }
   
-  // ====================================================================
-  // STEP 5: SETUP CONNECTION
-  // ====================================================================
-  conn._roomAuth = {
-    authenticated: !doc.passwordHash, // Auto-auth if no password
-    passwordVerified: false
+  // Setup authentication state - AFTER state is loaded so passwordHash is correct
+  const requiresPassword = !!doc.passwordHash
+  conn._auth = {
+    authenticated: !requiresPassword,
+    timeout: null
   }
   
-  doc.lastAccessed = Date.now()
+  // Password timeout for protected rooms
+  if (requiresPassword) {
+    conn._auth.timeout = setTimeout(() => {
+      if (!conn._auth.authenticated) {
+        console.warn(`⏰ [${roomName}] Auth timeout`)
+        conn.close(4002, 'Password required')
+      }
+    }, PASSWORD_AUTH_TIMEOUT)
+  }
+  
   doc.conns.set(conn, new Set())
   
-  // Message handling
-  conn.on('message', /** @param {ArrayBuffer} message */ message => 
+  // Message handler
+  conn.on('message', /** @param {ArrayBuffer} message */ message => {
     messageListener(conn, doc, new Uint8Array(message))
-  )
+  })
 
-  // Connection health monitoring
+  // Ping/pong for connection health
   let pongReceived = true
   const pingInterval = setInterval(() => {
     if (!pongReceived) {
-      if (doc.conns.has(conn)) {
-        closeConn(doc, conn)
-      }
+      closeConn(doc, conn)
       clearInterval(pingInterval)
     } else if (doc.conns.has(conn)) {
       pongReceived = false
-      try {
-        conn.ping()
-      } catch (e) {
+      try { conn.ping() } catch (e) {
         closeConn(doc, conn)
         clearInterval(pingInterval)
       }
     }
-  }, pingTimeout)
+  }, PING_TIMEOUT)
   
   conn.on('close', () => {
     closeConn(doc, conn)
     clearInterval(pingInterval)
+    if (conn._auth?.timeout) clearTimeout(conn._auth.timeout)
   })
   
-  conn.on('pong', () => {
-    pongReceived = true
-  })
+  conn.on('pong', () => { pongReceived = true })
   
-  // ====================================================================
-  // STEP 6: SEND INITIAL STATE
-  // ====================================================================
-  {
-    // Send sync step 1
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, messageSync)
-    syncProtocol.writeSyncStep1(encoder, doc)
-    send(doc, conn, encoding.toUint8Array(encoder))
-    
-    // Send awareness states
-    const awarenessStates = doc.awareness.getStates()
-    if (awarenessStates.size > 0) {
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageAwareness)
-      encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(
-        doc.awareness, 
-        Array.from(awarenessStates.keys())
-      ))
-      send(doc, conn, encoding.toUint8Array(encoder))
-    }
+  // Send initial state if already authenticated
+  if (conn._auth.authenticated) {
+    sendInitialSync(doc, conn)
   }
 }
