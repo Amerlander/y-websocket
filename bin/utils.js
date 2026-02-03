@@ -321,21 +321,30 @@ const messageListener = (conn, doc, message) => {
         
         // Apply awareness if authenticated
         if (!doc.passwordHash || conn._auth?.authenticated) {
+          // First apply the awareness update to get the full state
+          awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn)
+          
           // Check if an authenticated admin is setting/updating the password
-          const states = extractAwarenessStates(awarenessUpdate)
-          for (const [, state] of states.entries()) {
-            if (state?.user?.type === 'admin' && state?._roomPassword && conn._auth?.authenticated) {
-              const newPasswordHash = hashPassword(state._roomPassword)
-              // Only update if password changed
-              if (newPasswordHash !== doc.passwordHash) {
-                doc.passwordHash = newPasswordHash
-                persistPasswordHashToDoc(doc, newPasswordHash)
-                console.log(`🔒 [${doc.name}] Password updated by authenticated admin`)
+          // We need to check the FULL awareness state, not just the update
+          // because setLocalStateField only sends the changed field
+          if (conn._auth?.authenticated) {
+            const fullStates = doc.awareness.getStates()
+            // Get the client IDs controlled by this connection
+            const controlledIds = doc.conns.get(conn)
+            
+            for (const clientId of controlledIds || []) {
+              const state = fullStates.get(clientId)
+              if (state?.user?.type === 'admin' && state?._roomPassword) {
+                const newPasswordHash = hashPassword(state._roomPassword)
+                // Only update if password changed
+                if (newPasswordHash !== doc.passwordHash) {
+                  doc.passwordHash = newPasswordHash
+                  persistPasswordHashToDoc(doc, newPasswordHash)
+                  console.log(`🔒 [${doc.name}] Password updated by authenticated admin`)
+                }
               }
             }
           }
-          
-          awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn)
         }
         break
       }
