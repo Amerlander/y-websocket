@@ -11,6 +11,7 @@ import * as number from 'lib0/number'
 import { setupWSConnection, docs, getPersistence, getYDoc } from './utils.js'
 import { initCleanupScheduler } from './cleanup-scheduler.js'
 import { hashPassword, verifyPassword } from './room-auth.js'
+import { verifyJWT, getKeyFingerprint } from './admin-auth.js'
 
 const wss = new WebSocketServer({ noServer: true })
 const host = process.env.HOST || 'localhost'
@@ -137,32 +138,30 @@ const server = http.createServer(async (req, res) => {
     // First check if room exists in memory
     let doc = docs.get(roomName)
     
-    // If not in memory, check if it exists in persistence
+    // If not in memory, check if it exists in persistence (WITHOUT creating it)
     if (!doc) {
       const persistence = getPersistence()
       if (persistence?.provider) {
         try {
-          // Try to load from persistence
-          const persistedYdoc = await persistence.provider.getYDoc(roomName)
-          const stateVector = await persistence.provider.getStateVector?.(roomName)
+          // Use getAllDocNames to check if document exists
+          // This is more reliable than getStateVector which returns a minimal vector even for non-existent docs
+          const allDocNames = await persistence.provider.getAllDocNames()
+          const docExists = allDocNames.includes(roomName)
           
-          // Check if there's any data in the persisted document
-          const hasData = stateVector?.length > 0 || persistedYdoc.store.clients.size > 0
-          
-          if (!hasData) {
-            // Room doesn't exist
+          if (!docExists) {
             res.writeHead(404, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify({ exists: false }))
             return
           }
           
-          // Load the room into memory to get full info (including password hash)
+          // Room exists in persistence - now we can safely load it
           doc = getYDoc(roomName)
           if (doc._stateLoading) {
             await doc._stateLoading
           }
         } catch (e) {
           // If persistence check fails, room doesn't exist
+          console.error('Error checking room existence:', e)
           res.writeHead(404, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ exists: false }))
           return
@@ -188,7 +187,7 @@ const server = http.createServer(async (req, res) => {
     let adminPublicKey = null
     try {
       const roomClaimMap = doc.getMap('roomClaim')
-      adminPublicKey = roomClaimMap?.get('publicKey') || null
+      adminPublicKey = roomClaimMap?.get('roomPublicKey') || null
     } catch (e) { /* ignore */ }
     
     res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -233,11 +232,9 @@ const server = http.createServer(async (req, res) => {
           const persistence = getPersistence()
           if (persistence?.provider) {
             try {
-              const persistedYdoc = await persistence.provider.getYDoc(roomName)
-              const stateVector = await persistence.provider.getStateVector?.(roomName)
-              const hasData = stateVector?.length > 0 || persistedYdoc.store.clients.size > 0
-              
-              if (hasData) {
+              // Use getAllDocNames to check if document exists
+              const allDocNames = await persistence.provider.getAllDocNames()
+              if (allDocNames.includes(roomName)) {
                 doc = getYDoc(roomName)
                 if (doc._stateLoading) {
                   await doc._stateLoading
@@ -264,7 +261,7 @@ const server = http.createServer(async (req, res) => {
         let storedAdminKey = null
         try {
           const roomClaimMap = doc.getMap('roomClaim')
-          storedAdminKey = roomClaimMap?.get('publicKey') || null
+          storedAdminKey = roomClaimMap?.get('roomPublicKey') || null
         } catch (e) { /* ignore */ }
         
         if (!storedAdminKey) {
@@ -319,11 +316,9 @@ const server = http.createServer(async (req, res) => {
           const persistence = getPersistence()
           if (persistence?.provider) {
             try {
-              const persistedYdoc = await persistence.provider.getYDoc(roomName)
-              const stateVector = await persistence.provider.getStateVector?.(roomName)
-              const hasData = stateVector?.length > 0 || persistedYdoc.store.clients.size > 0
-              
-              if (hasData) {
+              // Use getAllDocNames to check if document exists
+              const allDocNames = await persistence.provider.getAllDocNames()
+              if (allDocNames.includes(roomName)) {
                 // Load the room into memory
                 doc = getYDoc(roomName)
                 if (doc._stateLoading) {
@@ -362,6 +357,426 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'Invalid request' }))
       }
     })
+    return
+  }
+  
+  // ============================================
+  // ADMIN API ENDPOINTS (JWT Protected)
+  // ============================================
+  
+  /**
+   * Helper: Verify JWT from Authorization header and check room access
+   * @param {http.IncomingMessage} req
+   * @param {string} roomName
+   * @returns {{ valid: boolean, payload?: any, error?: string }}
+   */
+  function verifyAdminAuth(req, roomName) {
+    const authHeader = req.headers.authorization
+    if (!authHeader?.startsWith('Bearer ')) {
+      return { valid: false, error: 'Missing authorization header' }
+    }
+    
+    const token = authHeader.slice(7)
+    const result = verifyJWT(token)
+    
+    if (!result.valid) {
+      return { valid: false, error: result.error }
+    }
+    
+    // Check room matches
+    if (result.payload.room !== roomName) {
+      return { valid: false, error: 'Token not valid for this room' }
+    }
+    
+    return { valid: true, payload: result.payload }
+  }
+  
+  /**
+   * Helper: Read JSON body from request
+   * @param {http.IncomingMessage} req
+   * @returns {Promise<any>}
+   */
+  function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+      let body = ''
+      req.on('data', chunk => { body += chunk })
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(body || '{}'))
+        } catch (e) {
+          reject(new Error('Invalid JSON'))
+        }
+      })
+      req.on('error', reject)
+    })
+  }
+  
+  /**
+   * Helper: Get or load room document
+   * @param {string} roomName
+   * @returns {Promise<any>}
+   */
+  async function getOrLoadRoom(roomName) {
+    let doc = docs.get(roomName)
+    
+    if (!doc) {
+      const persistence = getPersistence()
+      if (persistence?.provider) {
+        try {
+          // Use getAllDocNames to check if document exists
+          // This is more reliable than getStateVector which returns data even for non-existent docs
+          const allDocNames = await persistence.provider.getAllDocNames()
+          if (allDocNames.includes(roomName)) {
+            doc = getYDoc(roomName)
+            if (doc._stateLoading) {
+              await doc._stateLoading
+            }
+          }
+        } catch (e) {
+          // Room doesn't exist
+        }
+      }
+    }
+    
+    if (doc?._stateLoading) {
+      await doc._stateLoading
+    }
+    
+    return doc
+  }
+  
+  // POST /api/admin/room/:roomName/claim - Initialize room claim (create room as admin)
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/claim$/)) {
+    const roomName = decodeURIComponent(url.pathname.split('/')[4])
+    
+    try {
+      const body = await readJsonBody(req)
+      const { publicKey, adminId, adminRole, password } = body
+      
+      if (!publicKey || !adminId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'publicKey and adminId required' }))
+        return
+      }
+      
+      // Check if room already exists
+      let doc = await getOrLoadRoom(roomName)
+      
+      if (doc) {
+        // Room exists - check if it already has a claim
+        const roomClaimMap = doc.getMap('roomClaim')
+        const existingPublicKey = roomClaimMap.get('roomPublicKey') || roomClaimMap.get('publicKey')
+        
+        if (existingPublicKey) {
+          res.writeHead(409, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Room already claimed' }))
+          return
+        }
+      } else {
+        // Create new room
+        doc = getYDoc(roomName)
+        if (doc._stateLoading) {
+          await doc._stateLoading
+        }
+      }
+      
+      // Set up room claim
+      const roomClaimMap = doc.getMap('roomClaim')
+      const now = Date.now()
+      
+      roomClaimMap.set('roomPublicKey', publicKey)
+      roomClaimMap.set('createdAt', now)
+      roomClaimMap.set('authorizedAdmins', [{
+        id: adminId,
+        visitorId: adminId,
+        publicKey: publicKey,
+        role: adminRole || 'master',
+        addedAt: now,
+        addedBy: adminId
+      }])
+      roomClaimMap.set('activeSessions', [])
+      
+      // Set password if provided
+      if (password) {
+        const passwordHash = hashPassword(password)
+        doc.passwordHash = passwordHash
+        const roomSettingsMap = doc.getMap('roomSettings')
+        roomSettingsMap.set('passwordHash', passwordHash)
+      }
+      
+      console.log(`✅ Room "${roomName}" claimed by admin ${adminId}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, roomName }))
+    } catch (e) {
+      console.error('Error claiming room:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
+    return
+  }
+  
+  // POST /api/admin/room/:roomName/authorize-admin - Add sub-admin (JWT protected)
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/authorize-admin$/)) {
+    const roomName = decodeURIComponent(url.pathname.split('/')[4])
+    
+    const authResult = verifyAdminAuth(req, roomName)
+    if (!authResult.valid) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: authResult.error }))
+      return
+    }
+    
+    try {
+      const body = await readJsonBody(req)
+      const { newAdminId, newAdminPublicKey, role } = body
+      
+      if (!newAdminId || !newAdminPublicKey) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'newAdminId and newAdminPublicKey required' }))
+        return
+      }
+      
+      const doc = await getOrLoadRoom(roomName)
+      if (!doc) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Room not found' }))
+        return
+      }
+      
+      const roomClaimMap = doc.getMap('roomClaim')
+      const authorizedAdmins = roomClaimMap.get('authorizedAdmins') || []
+      
+      // Check if already authorized
+      if (authorizedAdmins.some(a => a.id === newAdminId || a.visitorId === newAdminId)) {
+        res.writeHead(409, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Admin already authorized' }))
+        return
+      }
+      
+      // Add new admin
+      const newAdmin = {
+        id: newAdminId,
+        visitorId: newAdminId,
+        publicKey: newAdminPublicKey,
+        role: role || 'sub-admin',
+        addedAt: Date.now(),
+        addedBy: authResult.payload.sub
+      }
+      
+      roomClaimMap.set('authorizedAdmins', [...authorizedAdmins, newAdmin])
+      
+      console.log(`✅ [${roomName}] Sub-admin ${newAdminId} added by ${authResult.payload.sub}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, admin: newAdmin }))
+    } catch (e) {
+      console.error('Error adding sub-admin:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
+    return
+  }
+  
+  // DELETE /api/admin/room/:roomName/authorize-admin/:adminId - Remove admin (JWT protected)
+  if (req.method === 'DELETE' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/authorize-admin\/[^/]+$/)) {
+    const parts = url.pathname.split('/')
+    const roomName = decodeURIComponent(parts[4])
+    const adminIdToRemove = decodeURIComponent(parts[6])
+    
+    const authResult = verifyAdminAuth(req, roomName)
+    if (!authResult.valid) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: authResult.error }))
+      return
+    }
+    
+    try {
+      const doc = await getOrLoadRoom(roomName)
+      if (!doc) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Room not found' }))
+        return
+      }
+      
+      const roomClaimMap = doc.getMap('roomClaim')
+      const authorizedAdmins = roomClaimMap.get('authorizedAdmins') || []
+      
+      // Can't remove master admin
+      const adminToRemove = authorizedAdmins.find(a => a.id === adminIdToRemove || a.visitorId === adminIdToRemove)
+      if (adminToRemove?.role === 'master') {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Cannot remove master admin' }))
+        return
+      }
+      
+      const filtered = authorizedAdmins.filter(a => a.id !== adminIdToRemove && a.visitorId !== adminIdToRemove)
+      roomClaimMap.set('authorizedAdmins', filtered)
+      
+      console.log(`✅ [${roomName}] Admin ${adminIdToRemove} removed by ${authResult.payload.sub}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch (e) {
+      console.error('Error removing admin:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
+    return
+  }
+  
+  // POST /api/admin/room/:roomName/user/:userId/approve - Approve user (JWT protected)
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/user\/[^/]+\/approve$/)) {
+    const parts = url.pathname.split('/')
+    const roomName = decodeURIComponent(parts[4])
+    const userId = decodeURIComponent(parts[6])
+    
+    const authResult = verifyAdminAuth(req, roomName)
+    if (!authResult.valid) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: authResult.error }))
+      return
+    }
+    
+    try {
+      const doc = await getOrLoadRoom(roomName)
+      if (!doc) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Room not found' }))
+        return
+      }
+      
+      // Update availableUsers in YJS
+      const rootMap = doc.getMap('root')
+      let availableUsers = rootMap.get('availableUsers') || {}
+      
+      if (!availableUsers.approved) availableUsers.approved = {}
+      if (!availableUsers.blocked) availableUsers.blocked = {}
+      
+      // Move from blocked to approved if needed
+      if (availableUsers.blocked[userId]) {
+        delete availableUsers.blocked[userId]
+      }
+      
+      availableUsers.approved[userId] = {
+        id: userId,
+        approvedAt: Date.now(),
+        approvedBy: authResult.payload.sub
+      }
+      
+      rootMap.set('availableUsers', availableUsers)
+      
+      console.log(`✅ [${roomName}] User ${userId} approved by ${authResult.payload.sub}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch (e) {
+      console.error('Error approving user:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
+    return
+  }
+  
+  // POST /api/admin/room/:roomName/user/:userId/block - Block user (JWT protected)
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/user\/[^/]+\/block$/)) {
+    const parts = url.pathname.split('/')
+    const roomName = decodeURIComponent(parts[4])
+    const userId = decodeURIComponent(parts[6])
+    
+    const authResult = verifyAdminAuth(req, roomName)
+    if (!authResult.valid) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: authResult.error }))
+      return
+    }
+    
+    try {
+      const doc = await getOrLoadRoom(roomName)
+      if (!doc) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Room not found' }))
+        return
+      }
+      
+      // Update availableUsers in YJS
+      const rootMap = doc.getMap('root')
+      let availableUsers = rootMap.get('availableUsers') || {}
+      
+      if (!availableUsers.approved) availableUsers.approved = {}
+      if (!availableUsers.blocked) availableUsers.blocked = {}
+      
+      // Move from approved to blocked
+      if (availableUsers.approved[userId]) {
+        delete availableUsers.approved[userId]
+      }
+      
+      availableUsers.blocked[userId] = {
+        id: userId,
+        blockedAt: Date.now(),
+        blockedBy: authResult.payload.sub
+      }
+      
+      rootMap.set('availableUsers', availableUsers)
+      
+      console.log(`🚫 [${roomName}] User ${userId} blocked by ${authResult.payload.sub}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch (e) {
+      console.error('Error blocking user:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
+    return
+  }
+  
+  // POST /api/admin/room/:roomName/settings - Update room settings (JWT protected)
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/admin\/room\/[^/]+\/settings$/)) {
+    const roomName = decodeURIComponent(url.pathname.split('/')[4])
+    
+    const authResult = verifyAdminAuth(req, roomName)
+    if (!authResult.valid) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: authResult.error }))
+      return
+    }
+    
+    try {
+      const body = await readJsonBody(req)
+      
+      const doc = await getOrLoadRoom(roomName)
+      if (!doc) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Room not found' }))
+        return
+      }
+      
+      const roomSettingsMap = doc.getMap('roomSettings')
+      
+      // Update allowed settings
+      const allowedSettings = ['roomName', 'approvalMode', 'hideUserNames', 'allowChat', 'theme']
+      for (const key of allowedSettings) {
+        if (body[key] !== undefined) {
+          roomSettingsMap.set(key, body[key])
+        }
+      }
+      
+      // Handle password change specially
+      if (body.password !== undefined) {
+        if (body.password) {
+          const passwordHash = hashPassword(body.password)
+          doc.passwordHash = passwordHash
+          roomSettingsMap.set('passwordHash', passwordHash)
+        } else {
+          doc.passwordHash = null
+          roomSettingsMap.delete('passwordHash')
+        }
+      }
+      
+      console.log(`⚙️ [${roomName}] Settings updated by ${authResult.payload.sub}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch (e) {
+      console.error('Error updating settings:', e)
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: e.message || 'Invalid request' }))
+    }
     return
   }
   

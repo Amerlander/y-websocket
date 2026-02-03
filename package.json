@@ -62,7 +62,9 @@
   "dependencies": {
     "y-protocols": "^1.0.6",
     "lib0": "^0.2.99",
-    "lodash.debounce": "^4.0.8"
+    "lodash.debounce": "^4.0.8",
+    "jsonwebtoken": "^9.0.2",
+    "openpgp": "^5.11.0"
   },
   "devDependencies": {
     "@types/lodash.debounce": "^4.0.9",
