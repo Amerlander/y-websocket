@@ -203,6 +203,104 @@ const server = http.createServer(async (req, res) => {
     return
   }
   
+  // POST /room/:roomName/admin-reset-password - Admin reset password using public key
+  if (req.method === 'POST' && url.pathname.startsWith('/room/') && url.pathname.endsWith('/admin-reset-password')) {
+    const roomName = decodeURIComponent(url.pathname.slice(6, -21))
+    
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', async () => {
+      try {
+        const { newPassword, adminPublicKey: providedKey } = JSON.parse(body)
+        
+        if (!newPassword || newPassword.length < 4) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Password must be at least 4 characters' }))
+          return
+        }
+        
+        if (!providedKey) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Admin public key required' }))
+          return
+        }
+        
+        // First check if room exists in memory
+        let doc = docs.get(roomName)
+        
+        // If not in memory, try to load from persistence
+        if (!doc) {
+          const persistence = getPersistence()
+          if (persistence?.provider) {
+            try {
+              const persistedYdoc = await persistence.provider.getYDoc(roomName)
+              const stateVector = await persistence.provider.getStateVector?.(roomName)
+              const hasData = stateVector?.length > 0 || persistedYdoc.store.clients.size > 0
+              
+              if (hasData) {
+                doc = getYDoc(roomName)
+                if (doc._stateLoading) {
+                  await doc._stateLoading
+                }
+              }
+            } catch (e) {
+              // Room doesn't exist
+            }
+          }
+        }
+        
+        if (!doc) {
+          res.writeHead(404, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Room not found' }))
+          return
+        }
+        
+        // Wait for state to be loaded
+        if (doc._stateLoading) {
+          await doc._stateLoading
+        }
+        
+        // Get stored admin public key from roomClaim
+        let storedAdminKey = null
+        try {
+          const roomClaimMap = doc.getMap('roomClaim')
+          storedAdminKey = roomClaimMap?.get('publicKey') || null
+        } catch (e) { /* ignore */ }
+        
+        if (!storedAdminKey) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Room has no admin key configured' }))
+          return
+        }
+        
+        // Normalize and compare keys
+        const normalizeKey = (key) => key.replace(/\\s+/g, '')
+        if (normalizeKey(providedKey) !== normalizeKey(storedAdminKey)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Invalid admin key' }))
+          return
+        }
+        
+        // Admin verified - update password hash
+        const newHash = hashPassword(newPassword)
+        doc.passwordHash = newHash
+        
+        // Also update in roomSettings map so it persists
+        const roomSettingsMap = doc.getMap('roomSettings')
+        roomSettingsMap.set('passwordHash', newHash)
+        
+        console.log(`🔑 Admin reset password for room "${roomName}"`)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+      } catch (e) {
+        console.error('Error resetting password:', e)
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Invalid request' }))
+      }
+    })
+    return
+  }
+  
   // POST /room/:roomName/verify-password - Verify password
   if (req.method === 'POST' && url.pathname.startsWith('/room/') && url.pathname.endsWith('/verify-password')) {
     const roomName = decodeURIComponent(url.pathname.slice(6, -16))
