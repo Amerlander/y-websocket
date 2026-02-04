@@ -323,7 +323,7 @@ const messageListener = (conn, doc, message) => {
         if (!doc.passwordHash || conn._auth?.authenticated) {
           // First apply the awareness update to get the full state
           awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn)
-          
+
           // Check if an authenticated admin is setting/updating the password
           // We need to check the FULL awareness state, not just the update
           // because setLocalStateField only sends the changed field
@@ -331,7 +331,7 @@ const messageListener = (conn, doc, message) => {
             const fullStates = doc.awareness.getStates()
             // Get the client IDs controlled by this connection
             const controlledIds = doc.conns.get(conn)
-            
+
             for (const clientId of controlledIds || []) {
               const state = fullStates.get(clientId)
               if (state?.user?.type === 'admin' && state?._roomPassword) {
