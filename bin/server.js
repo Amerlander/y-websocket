@@ -112,22 +112,50 @@ const server = http.createServer(async (req, res) => {
       }
     }
     
-    // Close connections and delete
-    doc.conns.forEach((_, conn) => {
-      try { conn.close(4010, 'Room deleted') } catch (e) { /* ignore */ }
-    })
-    doc.conns.clear()
-    docs.delete(roomName)
-    
-    const persistence = getPersistence()
-    if (persistence?.provider?.clearDocument) {
-      persistence.provider.clearDocument(roomName).catch(console.error)
+    // MARK ROOM AS DELETED INSTEAD OF REMOVING IT
+    // This keeps the Y.Doc available so clients can read the deleted flag
+    // and allow users to export their personal data. We also remove
+    // admin-specific sensitive data (password hash + admin public key) so
+    // the room cannot be administratively reopened from the server.
+    try {
+      const roomSettingsMap = doc.getMap('roomSettings')
+      const roomClaimMap = doc.getMap('roomClaim')
+      const adminPublicKey = roomClaimMap?.get('publicKey') || null
+
+      // Mark deletion metadata
+      roomSettingsMap.set('deleted', true)
+      roomSettingsMap.set('deletedAt', Date.now())
+      roomSettingsMap.set('deletedBy', adminPublicKey)
+
+      // Remove server-side secrets so room is effectively closed
+      doc.passwordHash = null
+      try {
+        // Remove persisted password, if stored in roomSettings map
+        if (typeof roomSettingsMap.delete === 'function') {
+          roomSettingsMap.delete('passwordHash')
+        } else {
+          roomSettingsMap.set('passwordHash', null)
+        }
+      } catch (e) { /* ignore */ }
+
+      try {
+        if (roomClaimMap && typeof roomClaimMap.delete === 'function') {
+          roomClaimMap.delete('publicKey')
+        } else if (roomClaimMap) {
+          roomClaimMap.set('publicKey', null)
+        }
+      } catch (e) { /* ignore */ }
+
+      console.log(`🗑️ Room "${roomName}" marked deleted by ${adminPublicKey || 'unknown'}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, markedDeleted: true }))
+      return
+    } catch (err) {
+      console.error('Error marking room deleted:', err)
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Failed to mark room deleted' }))
+      return
     }
-    
-    console.log(`🗑️ Room "${roomName}" deleted`)
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ success: true }))
-    return
   }
   
   // GET /room/:roomName/info - Get room info
@@ -186,11 +214,19 @@ const server = http.createServer(async (req, res) => {
     
     // Get admin public key from roomClaim if exists
     let adminPublicKey = null
+    let deleted = false
+    let deletedAt = null
     try {
       const roomClaimMap = doc.getMap('roomClaim')
       adminPublicKey = roomClaimMap?.get('publicKey') || null
     } catch (e) { /* ignore */ }
-    
+
+    try {
+      const roomSettingsMap = doc.getMap('roomSettings')
+      deleted = !!roomSettingsMap?.get('deleted')
+      deletedAt = roomSettingsMap?.get('deletedAt') || null
+    } catch (e) { /* ignore */ }
+
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       exists: true,
@@ -198,7 +234,9 @@ const server = http.createServer(async (req, res) => {
       hasPassword: !!doc.passwordHash,
       connectionCount: doc.conns.size,
       lastAccessed: doc.lastAccessed,
-      adminPublicKey
+      adminPublicKey,
+      deleted,
+      deletedAt
     }))
     return
   }
